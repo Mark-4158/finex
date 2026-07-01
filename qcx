@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+#   QCX
+#   Copyright (C) 2026  Mark A. Williams, Jr.
+
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU Affero General Public License as
+#   published by the Free Software Foundation, either version 3 of the
+#   License, or (at your option) any later version.
+
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU Affero General Public License for more details.
+
+#   You should have received a copy of the GNU Affero General Public License
+#   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+import locale, os, sys
+from datetime import datetime as dt
+from math import fma, hypot
+from pandas.tseries.offsets import BDay
+
+import matplotlib.pyplot as plt
+from configparser import ConfigParser
+from platformdirs import PlatformDirs
+
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+
+def stkcpy(dst, src, n):
+    ret = sys.maxsize
+
+    for sym, key in src.index:
+        t = key.value
+        if t < ret:
+            ret = t
+        dst.update({ t: fma(src[sym][key], n[sym], dst[t])
+                        if t in dst else src[sym][key] * n[sym] })
+
+    return ret
+
+
+def main():
+    dirs = PlatformDirs('qcx', 'QCX')
+    conf = ConfigParser()
+    conf.read(os.path.join(dirs.user_config_dir, 'settings.ini'))
+    key_api = conf['api.historical.key']['api']
+    key_prv = conf['api.historical.key']['secret']
+
+    pos = {}
+    sys_argc = len(sys.argv)
+    if sys_argc > 1:
+        sym = sys.argv[1].upper()
+        pos.update({sym: 1})
+    elif 'portfolio' in conf:
+        for sym in conf['portfolio']:
+            pos.update({sym.upper(): float(conf['portfolio'][sym])})
+    else:
+        return os.EX_USAGE
+
+    tm_end = dt.strptime(sys.argv[2], '%Y-%m-%d') if sys_argc > 2 else dt.now()
+    tm_begin = -27
+    if 'lookback' in conf and 'period' in conf['lookback']:
+        tm_begin = conf['lookback']['period']
+        tm_begin = BDay(-2 - abs(int(tm_begin))) + tm_end if tm_begin.isnumeric() else dt.strptime(tm_begin, '%Y-%m-%d')
+
+    client = StockHistoricalDataClient(key_api, key_prv)
+    request_params = StockBarsRequest(symbol_or_symbols=pos.keys(),
+                                      timeframe=TimeFrame.Day,
+                                      start=tm_begin,
+                                      end=tm_end)
+    bars = client.get_stock_bars(request_params)
+    #print(bars.df.to_string())
+
+    od = {}
+    hd = {}
+    ld = {}
+    cd = {}
+    stkcpy(od, bars.df['open'], pos)
+    stkcpy(hd, bars.df['high'], pos)
+    stkcpy(ld, bars.df['low'], pos)
+    ref = cd[stkcpy(cd, bars.df['close'], pos)]
+
+    kv = [.38941683884135123172, .55854110160866643062, .79847203156922506752,
+          .24868052219555288587, .12149089006418003684]
+    I = range(0, len(kv))
+    pv = [[] for i in I]
+    cv = []
+    for key in cd:
+        low = ld[key]
+        for i in I:
+            pv[i].append(fma(hypot(od[key] - low, hd[key] - low), kv[i], low) / ref)
+        fin = cd[key]
+        cv.append(fin / ref)
+    x = range(1 - len(cv), 1)
+
+    plt.figure(figsize=(10, 10))
+    plt.yscale('log')
+    plt.grid(visible=True, which='both')
+
+    plt.title((sym + ' (' if sys_argc > 1 else 'Portfolio (')
+              + locale.currency(fin, grouping=True) + ')')
+    plt.ylabel('Relative Change from ' + locale.currency(ref, grouping=True))
+    plt.xlabel('Business Days from ' + (BDay(0) + tm_end).strftime('%Y-%m-%d'))
+
+    plt.plot(x, pv[4], label='1/6-tile', color='darkgreen', linestyle='dashed')
+    plt.plot(x, pv[3], label='1/3-tile', color='limegreen', linestyle='dashed')
+    plt.plot(x, pv[2], label='5/6-tile', color='maroon', linestyle='dashed')
+    plt.plot(x, pv[1], label='2/3-tile', color='red', linestyle='dashed')
+    plt.plot(x, pv[0], label='1/2-tile', color='orange', linestyle='dashed')
+    plt.plot(x, cv, label='Close', color='darkblue')
+
+    plt.legend(reverse=True)
+    plt.show()
+
+    return os.EX_OK
+
+
+if __name__ == '__main__':
+    sys.exit(main())
