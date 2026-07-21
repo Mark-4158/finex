@@ -1,0 +1,183 @@
+#!/usr/bin/python3
+'''
+    QCX
+    Copyright (C) 2026  Mark A. Williams, Jr.
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as
+    published by the Free Software Foundation, either version 3 of the
+    License, or (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+'''
+import argparse, locale, os, sys
+from datetime import datetime as dt
+from math import fma, ldexp, log2
+from configparser import ConfigParser
+from platformdirs import PlatformDirs
+
+from pandas.tseries.offsets import Day#, Hour
+
+from matplotlib.lines import Line2D
+from matplotlib.collections import LineCollection
+import matplotlib.pyplot as plt
+import numpy as np
+from numpy.polynomial import Polynomial
+
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+
+def stkcpy(dst, src, n):
+    ret = sys.maxsize
+
+    for sym, key in src.index:
+        t = key.value
+        if t < ret:
+            ret = t
+        dst.update({ t: fma(src[sym][key], n[sym], dst[t])
+                        if t in dst else src[sym][key] * n[sym] })
+
+    return ret
+
+def main():
+    argr = argparse.ArgumentParser(prog='qcx', usage='%(prog)s [options]')
+    argr.add_argument('-d', '--date', type=ascii,
+                      help='end date (date or days prior today)')
+    argr.add_argument('-l', '--lookback', type=ascii,
+                      help='lookback period (days or start date)')
+    argr.add_argument('-s', '--symbol', type=ascii,
+                      help='ticker symbol')
+    args = argr.parse_args()
+
+    dirs = PlatformDirs('qcx', 'QCX')
+    conf = ConfigParser()
+    conf.read(os.path.join(dirs.user_config_dir, 'settings.ini'))
+    key_api = conf['api.historical.key']['api']
+    key_prv = conf['api.historical.key']['secret']
+
+    pos = {}
+    if args.symbol:
+        sym = args.symbol[1:-1].upper()
+        pos.update({sym: 1})
+    elif 'portfolio' in conf:
+        for sym in conf['portfolio']:
+            pos.update({sym.upper(): float(conf['portfolio'][sym])})
+    else:
+        return os.EX_USAGE
+
+    tm_fmt = '%Y-%m-%d'
+
+    if args.date:
+        tm_end = args.date[1:-1]
+    elif 'plot' in conf and 'date' in conf['plot']:
+        tm_end = conf['plot']['date']
+    try:
+        tm_end = dt.now() - Day(abs(int(tm_end))) if tm_end.isnumeric() else dt.strptime(tm_end, tm_fmt)
+    except NameError:
+        tm_end = dt.now()
+    #tm_end += Hour(8)
+
+    if args.lookback:
+        tm_begin = args.lookback[1:-1]
+    elif 'plot' in conf and 'lookback' in conf['plot']:
+        tm_begin = conf['plot']['lookback']
+    try:
+        tm_begin = tm_end - Day(abs(int(tm_begin))) if tm_begin.isnumeric() else dt.strptime(tm_begin, tm_fmt)
+    except NameError:
+        tm_begin = Day(-31) + tm_end
+
+    client = StockHistoricalDataClient(key_api, key_prv)
+    request_params = StockBarsRequest(symbol_or_symbols=pos.keys(),
+                                      timeframe=TimeFrame.Day,
+                                      start=tm_begin,
+                                      end=tm_end)
+    bars = client.get_stock_bars(request_params)
+    #print(bars.df.to_string())
+
+    od = {}
+    hd = {}
+    ld = {}
+    cd = {}
+    stkcpy(od, bars.df['open'], pos)
+    stkcpy(hd, bars.df['high'], pos)
+    stkcpy(ld, bars.df['low' ], pos)
+    ref = cd[stkcpy(cd, bars.df['close'], pos)]
+
+    pdf = Polynomial([.9375, 0., -1.875, 0., .9375]) # gives the unit poly-normal distribution
+    cdf = lambda mu, r: pdf(Polynomial([-mu/r, 1./r])).integ(lbnd=mu - r)
+
+    pv = []
+    cv = []
+    for key in cd:
+        N = hd[key]
+        I = ld[key]
+        N, I = N + I, N - I
+        I = cdf(N, I)
+        I/= ldexp(I(N), 1)
+        N = lambda x: ldexp(I(ldexp(x, 1)) * 25., 2)
+
+        pos = cd[key]
+        key = od[key]
+        pv.append(N(key))
+        pv.append(N(pos))
+        cv.append(key / ref)
+        cv.append(pos / ref)
+
+    N = len(cv)
+    I = range(0, N)
+
+    key = (cv[0] - cv[-1]) / N
+    rv = [fma(key, i, cv[i]) for i in I]
+    rv = np.fft.fft(rv)
+    key = int(ldexp(log2(N), -2) + .5)
+    rv[key + 1 : -key] = 0.
+    rv = np.fft.ifft(rv)
+    key = (cv[-1] - cv[0]) / N
+    rv = [fma(key, i, rv[i].real) for i in I]
+
+    plt.figure(figsize=(10, 10),
+               num=(sym + ' - QCX' if args.symbol else 'Portfolio - QCX'))
+    plt.yscale('log')
+    plt.grid(visible=True, which='both')
+
+    plt.title(str(int(fma(ldexp(cv[-1]**(1./N), 4), 625., -9999.5)))
+              + ' bp/d Mean Growth of '
+              + (sym + ' to ' if args.symbol else 'the Portfolio to ')
+              + locale.currency(pos, grouping=True))
+    plt.ylabel('Relative Change from ' + locale.currency(ref, grouping=True))
+    plt.xlabel('Trading Days from ' + tm_end.strftime(tm_fmt))
+
+    I = [ldexp(i, -1) for i in range(2 - N, 2)]
+
+    plt.scatter(I[ ::2], cv[ ::2], label='Open' , c=pv[ ::2], cmap='RdYlGn_r',
+                linewidth=0)
+    plt.scatter(I[1::2], cv[1::2], label='Close', c=pv[1::2], cmap='RdYlGn_r',
+                marker='^')
+    pos = (I, cv)
+    key = np.stack(pos, axis=-1)
+    pos = (key[0,:][None,:], (key[:-1,:] + key[1:,:]) * .5, key[-1,:][None,:])
+    pos = np.concat(pos)
+    pos = (pos[:-1,:], key, pos[1:,:])
+    key = np.stack(pos, axis=-2)
+    key = LineCollection(key, array=pv, cmap='RdYlGn_r', linestyle='dashed')
+    plt.gca().add_collection(key, autolim=False)
+
+    plt.plot(I, rv, label='Signal')
+
+    plt.colorbar(label='Percentile on Poly-Normal')
+    plt.legend()#reverse=True)
+    plt.show()
+
+    return os.EX_OK
+
+
+if __name__ == '__main__':
+    sys.exit(main())
